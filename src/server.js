@@ -13,7 +13,7 @@ import {
 } from './auth.js';
 import { AdminStore } from './adminStore.js';
 import { createRateLimit } from './rateLimit.js';
-import { fetchSchoolStudentId, maskedStudentId } from './identityProbe.js';
+import { fetchSchoolStudentId, maskedStudentId, normalizeStudentId } from './identityProbe.js';
 import { StudentIdentityStore } from './studentIdentityStore.js';
 import { ShareStore } from './shareStore.js';
 import { EngagementStore } from './engagementStore.js';
@@ -371,6 +371,42 @@ app.get('/health', (req, res) => {
   });
 });
 
+async function verifySchoolStudent(body, res, { deletion = false } = {}) {
+  const expectedStudentId = normalizeStudentId(body?.expectedStudentId);
+  if (!expectedStudentId) {
+    res.status(400).json({ success: false, error: deletion ? '学号无效。' : '本机学号无效。' });
+    return null;
+  }
+  // Legacy clients only send a JWXT cookie. New proofs always name a source
+  // and use a distinct field, so an old backend cannot forward a YJS cookie to JWXT.
+  const hasSchoolSession = Object.hasOwn(body, 'schoolSession');
+  const proof = body.schoolSession;
+  const identity = await fetchSchoolStudentId({
+    source: hasSchoolSession ? proof?.source ?? null : 'jwxt',
+    cookieHeader: hasSchoolSession ? proof?.cookie : body.schoolCookie
+  });
+  if (identity.status !== 'verified') {
+    const code = {
+      invalid_school_source: 400,
+      invalid_cookie: 400,
+      session_expired: 401,
+      school_rejected: 403,
+      no_student_id: 422
+    }[identity.status] ?? 503;
+    res.status(code).json({ success: false, code: identity.status,
+      error: identity.status === 'session_expired'
+        ? '学校会话已过期，请重新登录校园账户。' : '暂时无法通过学校核实学号。' });
+    return null;
+  }
+  if (identity.studentId !== expectedStudentId) {
+    res.status(409).json({ success: false, code: 'student_mismatch',
+      ...(deletion ? {} : { data: { maskedStudentId: maskedStudentId(identity.studentId) } }),
+      error: deletion ? '学校返回的学号与输入的学号不一致。' : '学校返回的学号与本机账户不一致。' });
+    return null;
+  }
+  return identity.studentId;
+}
+
 app.post('/api/v1/student/sessions', studentEnrollmentRateLimit, async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   if (req.body?.userInitiated !== true) {
@@ -378,31 +414,10 @@ app.post('/api/v1/student/sessions', studentEnrollmentRateLimit, async (req, res
       error: '请在应用中手动发起认证。' });
     return;
   }
-  const expectedStudentId = String(req.body?.expectedStudentId ?? '').trim().toUpperCase();
-  if (!/^[A-Z0-9]{6,24}$/.test(expectedStudentId)) {
-    res.status(400).json({ success: false, error: '本机学号无效。' });
-    return;
-  }
-  const identity = await fetchSchoolStudentId({ cookieHeader: req.body?.schoolCookie });
-  if (identity.status !== 'verified') {
-    const code = {
-      invalid_cookie: 400,
-      session_expired: 401,
-      school_rejected: 403,
-      no_student_id: 422
-    }[identity.status] ?? 503;
-    res.status(code).json({ success: false, code: identity.status,
-      error: '暂时无法通过学校核实学号。' });
-    return;
-  }
-  if (identity.studentId.toUpperCase() !== expectedStudentId) {
-    res.status(409).json({ success: false, code: 'student_mismatch',
-      data: { maskedStudentId: maskedStudentId(identity.studentId) },
-      error: '学校返回的学号与本机账户不一致。' });
-    return;
-  }
+  const studentId = await verifySchoolStudent(req.body, res);
+  if (studentId === null) return;
   const session = studentIdentityStore.createSession({
-    studentId: identity.studentId,
+    studentId,
     deviceLabel: req.body?.deviceLabel,
     previousToken: studentToken(req)
   });
@@ -437,26 +452,9 @@ app.post('/api/v1/student/sessions/revoke-all', requireStudentSession, (req, res
 
 app.post('/api/v1/student/data-deletion/verify', studentEnrollmentRateLimit, async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  const expectedStudentId = String(req.body?.expectedStudentId ?? '').trim().toUpperCase();
-  if (!/^[A-Z0-9]{6,24}$/.test(expectedStudentId)) {
-    res.status(400).json({ success: false, error: '学号无效。' });
-    return;
-  }
-  const identity = await fetchSchoolStudentId({ cookieHeader: req.body?.schoolCookie });
-  if (identity.status !== 'verified') {
-    const code = {
-      invalid_cookie: 400, session_expired: 401, school_rejected: 403, no_student_id: 422
-    }[identity.status] ?? 503;
-    res.status(code).json({ success: false, code: identity.status,
-      error: '暂时无法通过学校核实学号。' });
-    return;
-  }
-  if (identity.studentId.toUpperCase() !== expectedStudentId) {
-    res.status(409).json({ success: false, code: 'student_mismatch',
-      error: '学校返回的学号与输入的学号不一致。' });
-    return;
-  }
-  const grant = studentIdentityStore.createDeletionGrant(identity.studentId);
+  const studentId = await verifySchoolStudent(req.body, res, { deletion: true });
+  if (studentId === null) return;
+  const grant = studentIdentityStore.createDeletionGrant(studentId);
   if (!grant) {
     res.status(404).json({ success: false, code: 'no_data', error: '没有找到该学号的 ShuYo 数据。' });
     return;

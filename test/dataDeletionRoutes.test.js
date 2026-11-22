@@ -34,7 +34,13 @@ test('school verification deletes data without renewing a revoked device', async
   globalThis.fetch = async (url, options) => {
     if (new URL(url).hostname === 'jwxt.shu.edu.cn') {
       assert.equal(options.headers.cookie, 'JSESSIONID=fresh-school-login');
-      return new Response('<form id="form"><input name="xh_id" value="23123456"></form>');
+      assert.equal(new URL(url).pathname, '/jwglxt/xtgl/index_initMenu.html');
+      return new Response('<input type="hidden" id="sessionUserKey" value="23123456">');
+    }
+    if (new URL(url).hostname === 'yjs.shu.edu.cn') {
+      assert.equal(options.headers.cookie, 'GS_SESSIONID=fresh-school-login');
+      assert.equal(options.method, 'POST');
+      return Response.json({ code: '0', data: { userId: '23123456' } });
     }
     return originalFetch(url, options);
   };
@@ -44,13 +50,15 @@ test('school verification deletes data without renewing a revoked device', async
   const request = (route, method, body) => originalFetch(base + route, {
     method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
   });
+  const yjsProof = {
+    schoolSession: { source: 'yjs', cookie: 'GS_SESSIONID=fresh-school-login' },
+    expectedStudentId: '23123456'
+  };
   try {
     assert.equal((await request('/api/v1/student/data-deletion/verify', 'POST', {
       schoolCookie: 'JSESSIONID=fresh-school-login', expectedStudentId: '87654321'
     })).status, 409);
-    const verified = await request('/api/v1/student/data-deletion/verify', 'POST', {
-      schoolCookie: 'JSESSIONID=fresh-school-login', expectedStudentId: '23123456'
-    });
+    const verified = await request('/api/v1/student/data-deletion/verify', 'POST', yjsProof);
     assert.equal(verified.status, 200);
     const grant = (await verified.json()).data;
     assert.equal(grant.maskedStudentId, '23****56');
@@ -71,7 +79,16 @@ test('school verification deletes data without renewing a revoked device', async
       userInitiated: true
     });
     assert.equal(started.status, 201);
-    assert.notEqual((await started.json()).data.accountId, session.accountId);
+    const accountId = (await started.json()).data.accountId;
+    assert.notEqual(accountId, session.accountId);
+    const yjsSession = await request('/api/v1/student/sessions', 'POST', { ...yjsProof, userInitiated: true });
+    assert.equal(yjsSession.status, 201);
+    assert.equal((await yjsSession.json()).data.accountId, accountId);
+    const revokedProof = await request('/api/v1/student/sessions', 'POST', {
+      ...yjsProof, schoolSession: { ...yjsProof.schoolSession, source: 'unknown' }, userInitiated: true
+    });
+    assert.equal(revokedProof.status, 400);
+    assert.equal((await revokedProof.json()).code, 'invalid_school_source');
   } finally {
     globalThis.fetch = originalFetch;
     await new Promise((resolve) => server.close(resolve));
